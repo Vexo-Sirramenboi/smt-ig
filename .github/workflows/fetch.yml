@@ -12,132 +12,259 @@ permissions:
 jobs:
   fetch:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download HTML, JavaScript, CSS, and dependencies
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install browser and dependencies
         run: |
-          python3 - <<'PY'
+          python -m pip install --upgrade pip
+          pip install playwright beautifulsoup4 requests
+          python -m playwright install --with-deps chromium
+
+      - name: Crawl and download website
+        run: |
+          cat > crawler.py <<'PY'
+          import asyncio
           import re
-          import urllib.request
+          import json
+          import mimetypes
           from pathlib import Path
-          from urllib.parse import urljoin, urlparse, unquote
+          from urllib.parse import urljoin, urlparse, urldefrag, unquote
+          from collections import deque
+
+          import requests
+          from bs4 import BeautifulSoup
+          from playwright.async_api import async_playwright
 
           BASE = "https://triplet.mantaaway.com/"
           HOST = urlparse(BASE).netloc
-          OUTPUT = Path(".")
+          ROOT = Path(".")
 
-          downloaded = set()
-          queue = [BASE]
-          failed = []
+          visited = set()
+          queued = set()
+          queue = deque([BASE])
+          failures = []
+          session = requests.Session()
+          session.headers["User-Agent"] = "Mozilla/5.0"
 
-          patterns = [
-              r'''(?:src|href)\s*=\s*["']([^"']+)["']''',
-              r'''(?:import|from)\s*["']([^"']+\.(?:js|mjs))["']''',
-              r'''import\s*\(\s*["']([^"']+)["']\s*\)''',
-              r'''url\(\s*["']?([^)'"]+)["']?\s*\)''',
-              r'''@import\s+["']([^"']+)["']''',
-          ]
+          ASSET_EXTENSIONS = {
+              ".js", ".mjs", ".css", ".json", ".map",
+              ".wasm", ".svg", ".png", ".jpg", ".jpeg",
+              ".gif", ".webp", ".avif", ".ico", ".bmp",
+              ".woff", ".woff2", ".ttf", ".otf", ".eot",
+              ".mp4", ".webm", ".mp3", ".ogg", ".pdf",
+              ".xml", ".webmanifest", ".txt", ".bin"
+          }
 
-          while queue:
-              url = queue.pop(0)
-              url = urljoin(BASE, url).split("#")[0]
-
+          def local_path(url):
               parsed = urlparse(url)
+              path = unquote(parsed.path).lstrip("/") or "index.html"
 
-              if parsed.scheme not in ("http", "https"):
-                  continue
+              if parsed.query:
+                  from hashlib import sha256
+                  suffix = sha256(parsed.query.encode()).hexdigest()[:10]
+                  p = Path(path)
+                  path = str(p.with_name(f"{p.stem}_{suffix}{p.suffix}"))
 
-              if parsed.netloc != HOST or url in downloaded:
-                  continue
+              return Path(path)
 
-              downloaded.add(url)
+          def allowed(url):
+              parsed = urlparse(url)
+              return (
+                  parsed.scheme in ("http", "https")
+                  and parsed.netloc == HOST
+              )
 
-              try:
-                  request = urllib.request.Request(
-                      url,
-                      headers={"User-Agent": "Mozilla/5.0"}
-                  )
+          def normalize(url, base):
+              url = urldefrag(urljoin(base, url.strip()))[0]
+              return url.rstrip("#")
 
-                  with urllib.request.urlopen(request, timeout=30) as response:
-                      content = response.read()
-                      content_type = response.headers.get(
-                          "Content-Type", ""
+          def add(url, base):
+              url = normalize(url, base)
+
+              if not allowed(url) or url in queued or url in visited:
+                  return
+
+              queued.add(url)
+              queue.append(url)
+
+          def discover_text(text, url):
+              patterns = [
+                  r'''(?:src|href|poster|data-src|data-href)\s*=\s*["']([^"']+)["']''',
+                  r'''url\(\s*["']?([^)'"]+)["']?\s*\)''',
+                  r'''@import\s+["']([^"']+)["']''',
+                  r'''(?:import|from)\s*["']([^"']+)["']''',
+                  r'''import\(\s*["']([^"']+)["']\s*\)''',
+                  r'''["']([^"']+\.(?:js|mjs|css|json|wasm|woff2?|ttf|svg|png|jpe?g|webp|avif|mp4|webm)(?:\?[^"']*)?)["']''',
+              ]
+
+              for pattern in patterns:
+                  for match in re.findall(pattern, text, re.I):
+                      if match.startswith((
+                          "data:", "blob:", "javascript:", "mailto:",
+                          "tel:", "#"
+                      )):
+                          continue
+                      add(match, url)
+
+          def save_response(url, content, content_type):
+              target = local_path(url)
+              target.parent.mkdir(parents=True, exist_ok=True)
+
+              textual = (
+                  any(x in content_type.lower() for x in (
+                      "text/", "javascript", "json", "xml", "svg"
+                  ))
+                  or target.suffix.lower() in {
+                      ".html", ".htm", ".js", ".mjs", ".css",
+                      ".json", ".xml", ".svg", ".webmanifest", ".txt"
+                  }
+              )
+
+              if textual:
+                  text = content.decode("utf-8", errors="replace")
+                  discover_text(text, url)
+
+                  # Rewrite root-relative URLs for GitHub Pages project sites.
+                  # Full cross-site URLs are left unchanged.
+                  if target.suffix.lower() in {".html", ".htm", ".css", ".js", ".mjs"}:
+                      text = re.sub(
+                          r'''(["'(])/(?!/)([^"'()\s]+)''',
+                          lambda m: m.group(1) + "./" + m.group(2),
+                          text
                       )
 
-                  path = unquote(parsed.path).lstrip("/") or "index.html"
-                  destination = OUTPUT / path
-                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_text(text, encoding="utf-8")
+              else:
+                  target.write_bytes(content)
 
-                  is_text = (
-                      path.endswith((".html", ".js", ".mjs", ".css", ".json",
-                                     ".svg", ".xml", ".webmanifest"))
-                      or "javascript" in content_type
-                      or "text/css" in content_type
-                      or "text/html" in content_type
-                  )
+              print(f"Saved {target}")
 
-                  if is_text:
-                      text = content.decode("utf-8", errors="replace")
+          async def main():
+              async with async_playwright() as p:
+                  browser = await p.chromium.launch()
+                  page = await browser.new_page()
 
-                      # Convert root-relative asset references to paths
-                      # that work on GitHub Pages project sites.
-                      if path.endswith(".html"):
-                          text = re.sub(
-                              r'''((?:src|href)\s*=\s*["'])/([^/"']+)''',
-                              r'\1./\2',
-                              text
-                          )
+                  # Discover assets requested by the actual running page.
+                  async def on_response(response):
+                      url = response.url
+                      if not allowed(url):
+                          return
 
-                      destination.write_text(text, encoding="utf-8")
+                      add(url, BASE)
 
-                      # Discover dependencies referenced by this file.
-                      for pattern in patterns:
-                          for match in re.findall(pattern, text):
-                              dependency = match.strip()
+                      try:
+                          request = response.request
+                          if request.resource_type in (
+                              "script", "stylesheet", "image", "font",
+                              "media", "manifest", "xhr", "fetch", "other"
+                          ):
+                              body = await response.body()
+                              content_type = response.headers.get(
+                                  "content-type", ""
+                              )
+                              save_response(url, body, content_type)
+                      except Exception:
+                          pass
 
-                              if (
-                                  not dependency
-                                  or dependency.startswith(
-                                      ("data:", "blob:", "javascript:", "#")
-                                  )
-                              ):
-                                  continue
+                  page.on("response", on_response)
 
-                              dep_url = urljoin(url, dependency)
+                  try:
+                      await page.goto(
+                          BASE,
+                          wait_until="networkidle",
+                          timeout=60000
+                      )
+                  except Exception as error:
+                      print(f"Browser navigation warning: {error}")
 
-                              if urlparse(dep_url).netloc == HOST:
-                                  dep_path = urlparse(dep_url).path
+                  # Allow delayed frontend loading and scroll-triggered assets.
+                  for _ in range(5):
+                      await page.evaluate(
+                          "window.scrollTo(0, document.body.scrollHeight)"
+                      )
+                      await page.wait_for_timeout(1000)
 
-                                  if dep_path.endswith((
-                                      ".js", ".mjs", ".css", ".json",
-                                      ".wasm", ".svg", ".png", ".jpg",
-                                      ".jpeg", ".webp", ".woff", ".woff2",
-                                      ".ttf", ".ico", ".webmanifest"
-                                  )) or dep_path == "/":
-                                      if dep_url not in downloaded:
-                                          queue.append(dep_url)
-                  else:
-                      destination.write_bytes(content)
+                  try:
+                      discovered = await page.evaluate("""() => {
+                        const urls = new Set();
+                        for (const el of document.querySelectorAll(
+                          '[src], [href], [poster], [srcset]'
+                        )) {
+                          for (const attr of ['src', 'href', 'poster']) {
+                            if (el.getAttribute(attr))
+                              urls.add(el.getAttribute(attr));
+                          }
+                          if (el.srcset) {
+                            for (const part of el.srcset.split(',')) {
+                              urls.add(part.trim().split(/\\s+/)[0]);
+                            }
+                          }
+                        }
+                        for (const entry of performance.getEntriesByType('resource'))
+                          urls.add(entry.name);
+                        return [...urls];
+                      }""")
 
-                  print(f"Downloaded: {path}")
+                      for url in discovered:
+                          add(url, BASE)
+                  except Exception:
+                      pass
 
-              except Exception as error:
-                  print(f"Failed: {url} - {error}")
-                  failed.append(url)
+                  await browser.close()
 
-          print(f"\nDownloaded {len(downloaded) - len(failed)} resources.")
+              # Crawl discovered files recursively.
+              while queue:
+                  url = queue.popleft()
 
-          if BASE not in downloaded or not Path("index.html").exists():
-              raise SystemExit("Failed to download index.html.")
+                  if url in visited:
+                      continue
 
-          if failed:
-              print(f"Warning: {len(failed)} resources failed to download.")
+                  visited.add(url)
+
+                  try:
+                      response = session.get(url, timeout=30)
+                      response.raise_for_status()
+
+                      content_type = response.headers.get("content-type", "")
+                      save_response(
+                          response.url,
+                          response.content,
+                          content_type
+                      )
+
+                  except Exception as error:
+                      print(f"Failed: {url} ({error})")
+                      failures.append(url)
+
+              print(f"\nVisited URLs: {len(visited)}")
+              print(f"Failed URLs: {len(failures)}")
+
+              Path("crawl-report.json").write_text(
+                  json.dumps({
+                      "visited": sorted(visited),
+                      "failed": failures
+                  }, indent=2),
+                  encoding="utf-8"
+              )
+
+              if not Path("index.html").exists():
+                  raise SystemExit("index.html was not downloaded.")
+
+          asyncio.run(main())
           PY
 
-      - name: Commit changes
+          python crawler.py
+
+      - name: Commit downloaded website
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -147,6 +274,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Update Triplet website files"
+            git commit -m "Update Triplet website and assets"
             git push
           fi
