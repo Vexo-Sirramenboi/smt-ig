@@ -1,5 +1,5 @@
 
-name: Fetch Triplet index.html
+name: Fetch Triplet Website
 
 on:
   workflow_dispatch:
@@ -17,43 +17,124 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download and fix index.html
+      - name: Download HTML, JavaScript, CSS, and dependencies
         run: |
-          set -e
-
-          curl -fLsS --retry 3 \
-            "https://triplet.mantaaway.com/" \
-            -o index.html
-
           python3 - <<'PY'
+          import re
+          import urllib.request
           from pathlib import Path
+          from urllib.parse import urljoin, urlparse, unquote
 
-          path = Path("index.html")
-          html = path.read_text(encoding="utf-8")
+          BASE = "https://triplet.mantaaway.com/"
+          HOST = urlparse(BASE).netloc
+          OUTPUT = Path(".")
 
-          replacements = {
-              'src="/assets/':
-                  'src="https://triplet.mantaaway.com/assets/',
-              "src='/assets/":
-                  "src='https://triplet.mantaaway.com/assets/",
-              'href="/assets/':
-                  'href="https://triplet.mantaaway.com/assets/',
-              "href='/assets/":
-                  "href='https://triplet.mantaaway.com/assets/",
-              'href="/edu.svg"':
-                  'href="https://triplet.mantaaway.com/edu.svg"',
-              'href="/site.webmanifest"':
-                  'href="https://triplet.mantaaway.com/site.webmanifest"',
-          }
+          downloaded = set()
+          queue = [BASE]
+          failed = []
 
-          for old, new in replacements.items():
-              html = html.replace(old, new)
+          patterns = [
+              r'''(?:src|href)\s*=\s*["']([^"']+)["']''',
+              r'''(?:import|from)\s*["']([^"']+\.(?:js|mjs))["']''',
+              r'''import\s*\(\s*["']([^"']+)["']\s*\)''',
+              r'''url\(\s*["']?([^)'"]+)["']?\s*\)''',
+              r'''@import\s+["']([^"']+)["']''',
+          ]
 
-          if "<html" not in html.lower():
-              raise SystemExit("Error: Downloaded file is not HTML.")
+          while queue:
+              url = queue.pop(0)
+              url = urljoin(BASE, url).split("#")[0]
 
-          path.write_text(html, encoding="utf-8")
-          print("Successfully downloaded and updated index.html.")
+              parsed = urlparse(url)
+
+              if parsed.scheme not in ("http", "https"):
+                  continue
+
+              if parsed.netloc != HOST or url in downloaded:
+                  continue
+
+              downloaded.add(url)
+
+              try:
+                  request = urllib.request.Request(
+                      url,
+                      headers={"User-Agent": "Mozilla/5.0"}
+                  )
+
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      content = response.read()
+                      content_type = response.headers.get(
+                          "Content-Type", ""
+                      )
+
+                  path = unquote(parsed.path).lstrip("/") or "index.html"
+                  destination = OUTPUT / path
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+
+                  is_text = (
+                      path.endswith((".html", ".js", ".mjs", ".css", ".json",
+                                     ".svg", ".xml", ".webmanifest"))
+                      or "javascript" in content_type
+                      or "text/css" in content_type
+                      or "text/html" in content_type
+                  )
+
+                  if is_text:
+                      text = content.decode("utf-8", errors="replace")
+
+                      # Convert root-relative asset references to paths
+                      # that work on GitHub Pages project sites.
+                      if path.endswith(".html"):
+                          text = re.sub(
+                              r'''((?:src|href)\s*=\s*["'])/([^/"']+)''',
+                              r'\1./\2',
+                              text
+                          )
+
+                      destination.write_text(text, encoding="utf-8")
+
+                      # Discover dependencies referenced by this file.
+                      for pattern in patterns:
+                          for match in re.findall(pattern, text):
+                              dependency = match.strip()
+
+                              if (
+                                  not dependency
+                                  or dependency.startswith(
+                                      ("data:", "blob:", "javascript:", "#")
+                                  )
+                              ):
+                                  continue
+
+                              dep_url = urljoin(url, dependency)
+
+                              if urlparse(dep_url).netloc == HOST:
+                                  dep_path = urlparse(dep_url).path
+
+                                  if dep_path.endswith((
+                                      ".js", ".mjs", ".css", ".json",
+                                      ".wasm", ".svg", ".png", ".jpg",
+                                      ".jpeg", ".webp", ".woff", ".woff2",
+                                      ".ttf", ".ico", ".webmanifest"
+                                  )) or dep_path == "/":
+                                      if dep_url not in downloaded:
+                                          queue.append(dep_url)
+                  else:
+                      destination.write_bytes(content)
+
+                  print(f"Downloaded: {path}")
+
+              except Exception as error:
+                  print(f"Failed: {url} - {error}")
+                  failed.append(url)
+
+          print(f"\nDownloaded {len(downloaded) - len(failed)} resources.")
+
+          if BASE not in downloaded or not Path("index.html").exists():
+              raise SystemExit("Failed to download index.html.")
+
+          if failed:
+              print(f"Warning: {len(failed)} resources failed to download.")
           PY
 
       - name: Commit changes
@@ -61,11 +142,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add index.html
+          git add -A
 
           if git diff --cached --quiet; then
-            echo "No changes to index.html."
+            echo "No changes to commit."
           else
-            git commit -m "Update Triplet index.html"
+            git commit -m "Update Triplet website files"
             git push
           fi
