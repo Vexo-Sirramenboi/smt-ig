@@ -17,17 +17,44 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download index.html
+      - name: Download and fix index.html
         run: |
-          curl -fLsS \
-            --retry 3 \
+          set -e
+
+          curl -fLsS --retry 3 \
             "https://triplet.mantaaway.com/" \
             -o index.html
 
-          if ! grep -qi "<html" index.html; then
-            echo "Downloaded file does not appear to be HTML."
-            exit 1
-          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("index.html")
+          html = path.read_text(encoding="utf-8")
+
+          replacements = {
+              'src="/assets/':
+                  'src="https://triplet.mantaaway.com/assets/',
+              "src='/assets/":
+                  "src='https://triplet.mantaaway.com/assets/",
+              'href="/assets/':
+                  'href="https://triplet.mantaaway.com/assets/',
+              "href='/assets/":
+                  "href='https://triplet.mantaaway.com/assets/",
+              'href="/edu.svg"':
+                  'href="https://triplet.mantaaway.com/edu.svg"',
+              'href="/site.webmanifest"':
+                  'href="https://triplet.mantaaway.com/site.webmanifest"',
+          }
+
+          for old, new in replacements.items():
+              html = html.replace(old, new)
+
+          if "<html" not in html.lower():
+              raise SystemExit("Error: Downloaded file is not HTML.")
+
+          path.write_text(html, encoding="utf-8")
+          print("Successfully downloaded and updated index.html.")
+          PY
 
       - name: Commit changes
         run: |
