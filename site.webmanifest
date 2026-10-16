@@ -1,0 +1,23 @@
+{
+  "name": "TripleT Academy — Study Guides & Practice Tests",
+  "short_name": "TripleT Academy",
+  "description": "Revision notes, practice questions and exam guides for core school subjects.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0a0a0c",
+  "theme_color": "#ff7a1a",
+  "categories": [
+    "education",
+    "productivity",
+    "books"
+  ],
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
